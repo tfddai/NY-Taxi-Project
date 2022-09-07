@@ -1,0 +1,549 @@
+import requests
+from bs4 import BeautifulSoup
+
+!apt-get update
+
+!apt-get install openjdk-8-jdk-headless -qq > /dev/null
+!wget -q https://www-us.apache.org/dist/spark/spark-2.4.7/spark-2.4.7-bin-hadoop2.7.tgz
+!tar xf spark-2.4.7-bin-hadoop2.7.tgz
+!pip install -q findspark
+
+import os
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-8-openjdk-amd64"
+os.environ["SPARK_HOME"] = "/content/spark-2.4.7-bin-hadoop2.7"
+
+import findspark
+findspark.init()
+
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("taxiProject").getOrCreate()
+
+import pyspark.sql.functions as F
+from datetime import datetime
+
+from pyspark.sql.functions import lit
+
+from pyspark.sql.functions import to_timestamp
+from pyspark.sql.types import DateType
+from pyspark.sql.types import long
+from pyspark.sql.functions import date_format
+
+from pyspark.sql.functions import col
+
+#grabbing the urls for each dataset
+url = "https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page"
+data_urls = []
+
+r = requests.get(url)
+soup = BeautifulSoup(r.content, "html.parser")
+
+for a in soup.find_all(name="a"):
+  if a.text == "Yellow Taxi Trip Records" or a.text == "Green Taxi Trip Records":
+    data_url = a['href']
+    data_urls.append(data_url)
+    
+
+#shorten our data to the last 2 years
+data = data_urls[2:36]
+
+#green trip data
+#data[1][-26:]
+#yellow trip data
+#'green' in data[2][-27:]
+
+
+!wget -q 'https://s3.amazonaws.com/nyc-tlc/trip+data/yellow_tripdata_2020-01.csv'
+!wget -q 'https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2020-01.csv'
+df_yellow = spark.read.csv('yellow_tripdata_2020-01.csv', header=True, inferSchema=True)
+df_green = spark.read.csv('green_tripdata_2020-01.csv', header=True, inferSchema=True)
+
+for url in data:
+  !wget -q $url
+  if 'yellow' in url:
+    df_temp = spark.read.csv(url[-27:], header=True, inferSchema=True)
+    df_yellow = df_yellow.union(df_temp)
+  if 'green' in url:
+    df_temp = spark.read.csv(url[-26:], header=True, inferSchema=True)
+    df_green = df_green.union(df_temp)
+  
+  
+
+**Yellow Taxi Data**
+
+#Drop unnecessary columns
+df_yellow = df_yellow.drop("store_and_fwd_flag",
+               'payment_type',
+               'extra',
+               'mta_tax',
+               'improvement_surcharge',
+               'tip_amount',
+               'tolls_amount',
+               'total_amount',
+               'congestion_surcharge',
+               'VendorID')
+
+#remove rows with null values
+df_yellow = df_yellow.na.drop()
+
+#remove rows where passenger count is less than 1 and under 10
+#remove rows with outlier fare amounts
+#remove rows with outlier trip distances
+df_yellow = df_yellow.where((df_yellow['passenger_count'] > 0) &
+                          (df_yellow['passenger_count'] <= 9) &
+                          (df_yellow['fare_amount'] >= 2.50) &
+                          (df_yellow['fare_amount'] <= 100) &
+                          (df_yellow['trip_distance'] > 0) &
+                          (df_yellow['trip_distance'] <= 100))
+
+#create column for trip times in minutes
+trip_time_col = col('tpep_dropoff_datetime').cast('long') - col('tpep_pickup_datetime').cast('long')
+df_yellow = df_yellow.withColumn('trip_time', trip_time_col/60)
+
+#remove outlier trip times
+df_yellow = df_yellow.where((df_yellow['trip_time'] > 0) &
+                          (df_yellow['trip_time'] <= 240))
+
+#remove trips that stopped at midnight (seems like some meters that were left on automatically stopped at midnight, resulting in outlier trip_times)
+split_col = F.split(df_yellow['tpep_dropoff_datetime'], ' ')
+df_yellow = df_yellow.withColumn('dropoff_time', split_col.getItem(1))
+df_yellow = df_yellow.where(df_yellow['dropoff_time'] != '00:00:00')
+
+#create columns for pickup time, year, date, and weekday
+split_col = F.split(df_yellow['tpep_pickup_datetime'], ' ')
+df_yellow = df_yellow.withColumn('pickup_date', split_col.getItem(0))
+df_yellow = df_yellow.withColumn('year', split_col.getItem(0).substr(1, 4))
+df_yellow = df_yellow.withColumn('date', split_col.getItem(0).substr(6, 10))
+df_yellow = df_yellow.withColumn('pickup_time', split_col.getItem(1))
+df_yellow = df_yellow.withColumn('weekday', F.date_format('pickup_date', 'E'))
+
+#create column for holidays
+df_yellow = df_yellow.withColumn('holiday',
+                               F.when((F.col('date') == '01-01') |
+                                      (F.col('date') == '12-31'),
+                                      'New Years')\
+                               .when(((F.col('date') == '05-25') |
+                                     (F.col('date') == '05-26') |
+                                     (F.col('date') == '05-27') |
+                                     (F.col('date') == '05-28') |
+                                     (F.col('date') == '05-29') |
+                                     (F.col('date') == '05-30') |
+                                     (F.col('date') == '05-31')) &
+                                     (F.col('weekday') == 'Mon'),
+                                     'Memorial Day')\
+                               .when(F.col('date') == '07-04',
+                                     'Independence Day')\
+                               .when(((F.col('date') == '09-01') |
+                                     (F.col('date') == '09-02') |
+                                     (F.col('date') == '09-03') |
+                                     (F.col('date') == '09-04') |
+                                     (F.col('date') == '09-05') |
+                                     (F.col('date') == '09-06') |
+                                     (F.col('date') == '09-07')) &
+                                     (F.col('weekday') == 'Mon'),
+                                     'Labor Day')\
+                               .when(((F.col('date') == '11-22') |
+                                     (F.col('date') == '11-23') |
+                                     (F.col('date') == '11-24') |
+                                     (F.col('date') == '11-25') |
+                                     (F.col('date') == '11-26') |
+                                     (F.col('date') == '11-27') |
+                                     (F.col('date') == '11-28') |
+                                     (F.col('date') == '11-29')) & 
+                                     ((F.col('weekday') == 'Thu') |
+                                     (F.col('weekday') == 'Fri')),
+                                     'Thanksgiving')\
+                               .when((F.col('date') == '12-24') |
+                                     (F.col('date') == '12-25'), 
+                                     'Christmas')\
+                               .otherwise('None')
+                               )
+
+#create holiday y/n
+df_yellow = df_yellow.withColumn('holiday y/n',
+                              F.when(F.col('holiday') == 'None', 'N').otherwise('Y'))
+
+#create columns for months and seasons
+df_yellow = df_yellow.withColumn('month', F.date_format('pickup_date', 'L'))
+df_yellow = df_yellow.withColumn('season', 
+                               F.when((F.col('month') == '3') |
+                                      (F.col('month') == '4') |
+                                      (F.col('month') == '5'),
+                                      'spring')\
+                               .when((F.col('month') == '6') |
+                                     (F.col('month') == '7') |
+                                     (F.col('month') == '8'),
+                                     'summer')\
+                               .when((F.col('month') == '9') |
+                                     (F.col('month') == '10') |
+                                     (F.col('month') == '11'),
+                                     'autumn')\
+                               .when((F.col('month') == '12') |
+                                     (F.col('month') == '1') |
+                                     (F.col('month') == '2'),
+                                     'winter'))
+
+#Creating column for rush hour
+df_yellow = df_yellow.withColumn('year0_time',
+                               to_timestamp(col('pickup_time'), 'HH:mm:ss'))
+df_yellow = df_yellow.withColumn('rush_hour',
+                               F.when((F.col('year0_time') >= '1970-01-01 06:00:00') &
+                                      (F.col('year0_time') < '1970-01-01 10:00:00'),
+                                      'Y')\
+                               .when((F.col('year0_time') >= '1970-01-01 15:00:00') &
+                                      (F.col('year0_time') <= '1970-01-01 19:00:00'),
+                                      'Y')\
+                               .otherwise('N')
+                               )
+
+#Creating column for weekends
+df_yellow = df_yellow.withColumn('weekend',
+                               F.when((F.col('weekday') == 'Sat') |
+                                      (F.col('weekday') == 'Sun'),
+                                      'Y')
+                               .otherwise('N'))
+
+#Creating column for average trip speed
+df_yellow = df_yellow.withColumn('avg_speed',
+                               (df_yellow['trip_distance'] / df_yellow['trip_time']) * 60)
+
+#Drop extra columns
+df_yellow = df_yellow.drop('PULocationID',
+                         'DOLocationID',
+                         'pickup_time',
+                         'dropoff_time',
+                         'year0_time')
+df_yellow.show(5)
+
+**Green Taxi Data**
+
+#Drop unnecessary columns
+df_green = df_green.drop('store_and_fwd_flag',
+              'payment_type',
+              'ehail_fee',
+              'extra',
+              'mta_tax',
+              'improvement_surcharge',
+              'tip_amount',
+              'tolls_amount',
+              'total_amount',
+              'congestion_surcharge',
+              'VendorID')
+
+#remove rows with null values
+df_green = df_green.na.drop()
+
+#remove rows where passenger count is less than 1 and under 10
+#remove rows with outlier fare amounts
+#remove rows with outlier trip distances
+df_green = df_green.where((df_green['passenger_count'] > 0) &
+                          (df_green['passenger_count'] <= 9) &
+                          (df_green['fare_amount'] >= 2.50) &
+                          (df_green['fare_amount'] <= 100) &
+                          (df_green['trip_distance'] > 0) &
+                          (df_green['trip_distance'] <= 100))
+
+#create column for trip times in minutes
+trip_time_col = col('lpep_dropoff_datetime').cast('long') - col('lpep_pickup_datetime').cast('long')
+df_green = df_green.withColumn('trip_time', trip_time_col/60)
+
+#remove outlier trip times
+df_green = df_green.where((df_green['trip_time'] > 0) &
+                          (df_green['trip_time'] <= 240))
+
+#remove trips that stopped at midnight (seems like some meters that were left on automatically stopped at midnight, resulting in outlier trip_times)
+split_col = F.split(df_green['lpep_dropoff_datetime'], ' ')
+df_green = df_green.withColumn('dropoff_time', split_col.getItem(1))
+df_green = df_green.where(df_green['dropoff_time'] != '00:00:00')
+
+#create columns for pickup time, year, date, and weekday
+split_col = F.split(df_green['lpep_pickup_datetime'], ' ')
+df_green = df_green.withColumn('pickup_date', split_col.getItem(0))
+df_green = df_green.withColumn('year', split_col.getItem(0).substr(1, 4))
+df_green = df_green.withColumn('date', split_col.getItem(0).substr(6, 10))
+df_green = df_green.withColumn('pickup_time', split_col.getItem(1))
+df_green = df_green.withColumn('weekday', F.date_format('pickup_date', 'E'))
+
+#create column for holidays
+df_green = df_green.withColumn('holiday',
+                               F.when((F.col('date') == '01-01') |
+                                      (F.col('date') == '12-31'),
+                                      'New Years')\
+                               .when(((F.col('date') == '05-25') |
+                                     (F.col('date') == '05-26') |
+                                     (F.col('date') == '05-27') |
+                                     (F.col('date') == '05-28') |
+                                     (F.col('date') == '05-29') |
+                                     (F.col('date') == '05-30') |
+                                     (F.col('date') == '05-31')) &
+                                     (F.col('weekday') == 'Mon'),
+                                     'Memorial Day')\
+                               .when(F.col('date') == '07-04',
+                                     'Independence Day')\
+                               .when(((F.col('date') == '09-01') |
+                                     (F.col('date') == '09-02') |
+                                     (F.col('date') == '09-03') |
+                                     (F.col('date') == '09-04') |
+                                     (F.col('date') == '09-05') |
+                                     (F.col('date') == '09-06') |
+                                     (F.col('date') == '09-07')) &
+                                     (F.col('weekday') == 'Mon'),
+                                     'Labor Day')\
+                               .when(((F.col('date') == '11-22') |
+                                     (F.col('date') == '11-23') |
+                                     (F.col('date') == '11-24') |
+                                     (F.col('date') == '11-25') |
+                                     (F.col('date') == '11-26') |
+                                     (F.col('date') == '11-27') |
+                                     (F.col('date') == '11-28') |
+                                     (F.col('date') == '11-29')) & 
+                                     ((F.col('weekday') == 'Thu') |
+                                     (F.col('weekday') == 'Fri')),
+                                     'Thanksgiving')\
+                               .when((F.col('date') == '12-24') |
+                                     (F.col('date') == '12-25'), 
+                                     'Christmas')\
+                               .otherwise('None')
+                               )
+
+#create holiday y/n
+df_green = df_green.withColumn('holiday y/n',
+                              F.when(F.col('holiday') == 'None', 'N').otherwise('Y'))
+
+#create columns for months and seasons
+df_green = df_green.withColumn('month', F.date_format('pickup_date', 'L'))
+df_green = df_green.withColumn('season', 
+                               F.when((F.col('month') == '3') |
+                                      (F.col('month') == '4') |
+                                      (F.col('month') == '5'),
+                                      'spring')\
+                               .when((F.col('month') == '6') |
+                                     (F.col('month') == '7') |
+                                     (F.col('month') == '8'),
+                                     'summer')\
+                               .when((F.col('month') == '9') |
+                                     (F.col('month') == '10') |
+                                     (F.col('month') == '11'),
+                                     'autumn')\
+                               .when((F.col('month') == '12') |
+                                     (F.col('month') == '1') |
+                                     (F.col('month') == '2'),
+                                     'winter'))
+
+#Creating column for rush hour
+df_green = df_green.withColumn('year0_time',
+                               to_timestamp(col('pickup_time'), 'HH:mm:ss'))
+df_green = df_green.withColumn('rush_hour',
+                               F.when((F.col('year0_time') >= '1970-01-01 06:00:00') &
+                                      (F.col('year0_time') < '1970-01-01 10:00:00'),
+                                      'Y')\
+                               .when((F.col('year0_time') >= '1970-01-01 15:00:00') &
+                                      (F.col('year0_time') <= '1970-01-01 19:00:00'),
+                                      'Y')\
+                               .otherwise('N')
+                               )
+
+#Creating column for weekends
+df_green = df_green.withColumn('weekend',
+                               F.when((F.col('weekday') == 'Sat') |
+                                      (F.col('weekday') == 'Sun'),
+                                      'Y')
+                               .otherwise('N'))
+
+#Creating column for average trip speed
+df_green = df_green.withColumn('avg_speed',
+                               (df_green['trip_distance'] / df_green['trip_time']) * 60)
+
+df_green = df_green.drop('PULocationID',
+                         'DOLocationID',
+                         'pickup_time',
+                         'dropoff_time',
+                         'year0_time')
+df_green.show(5)
+
+**Combining the two datasets**
+
+df_yellow = df_yellow.withColumn('trip_type',
+                                 lit(3))
+
+#reorder df_yellow columns
+df_yellow = df_yellow.select('tpep_pickup_datetime',
+                             'tpep_dropoff_datetime',
+                             'RatecodeID',
+                             'passenger_count',
+                             'trip_distance',
+                             'fare_amount',
+                             'trip_type',
+                             'trip_time',
+                             'pickup_date',
+                             'year',
+                             'date',
+                             'weekday',
+                             'holiday',
+                             'holiday y/n',
+                             'month',
+                             'season',
+                             'rush_hour',
+                             'weekend',
+                             'avg_speed')
+
+
+#more data cleaning
+df_yellow = df_yellow.where((df_yellow['tpep_pickup_datetime'] >= '2019-01-01 00:00:00') &
+                          (df_yellow['tpep_pickup_datetime'] < '2020-07-31 00:00:00'))
+
+df_green = df_green.where((df_green['lpep_pickup_datetime'] >= '2019-01-01 00:00:00') &
+                          (df_green['lpep_pickup_datetime'] < '2020-07-31 00:00:00'))
+
+
+df_yellow = df_yellow.withColumnRenamed('tpep_pickup_datetime', 'lpep_pickup_datetime')
+df_yellow = df_yellow.withColumnRenamed('tpep_dropoff_datetime', 'lpep_dropoff_datetime')
+
+df_full = df_yellow.union(df_green)
+df_full.na.drop()
+df_full.show(5)
+
+df_full = df_full.drop('year',
+                       'date',
+                       'weekday',
+                       'holiday',
+                       'holiday y/n',
+                       'month',
+                       'season',
+                       'weekend',
+                       'lpep_pickup_datetime',
+                       'lpep_dropoff_datetime')
+
+df_full.show(5)
+
+df_full.printSchema()
+
+**Regression Analysis**
+
+from pyspark.sql.types import IntegerType
+df_date = spark.read.csv('date.csv', header=True, inferSchema=False)
+df_date = df_date.drop('date',
+                       'holiday y/n')
+
+df_date.show(5)
+df_date.printSchema()
+
+#index date table and transform into OneHot
+from pyspark.ml.feature import OneHotEncoderEstimator, StringIndexer
+
+index_cols = ['year', 'day', 'holiday', 'month']
+
+df_indexed = df_date
+
+for column in index_cols:
+  indexer = StringIndexer(inputCol=column, outputCol=column+'_id')
+  index_transformer = indexer.fit(df_indexed)
+  df_indexed = index_transformer.transform(df_indexed)
+
+df_indexed.show(5)
+
+onehot_cols = ['year_id', 'day_id', 'holiday_id', 'month_id']
+
+df_encoded = df_indexed
+
+for column in onehot_cols:
+  encoder = OneHotEncoderEstimator(inputCols=[column], outputCols = [column+'_e'])
+  encoder_transformer = encoder.fit(df_encoded)
+  df_encoded = encoder_transformer.transform(df_encoded)
+
+df_encoded.show(5)
+
+df_date_encoded = df_encoded.select('pickup_date',
+                                    'year_id_e',
+                                    'day_id_e',
+                                    'holiday_id_e',
+                                    'month_id_e',)
+
+df_date_encoded.show(5)
+
+#index rate_code and transform into OneHot
+df_ratecode = spark.read.csv('ratecode.csv', header=True, inferSchema=True)
+df_ratecode.show()
+
+df_indexed = df_ratecode
+indexer = StringIndexer(inputCol='RateCode', outputCol='ratecode_id')
+index_transformer = indexer.fit(df_indexed)
+df_indexed = index_transformer.transform(df_indexed)
+
+df_indexed.show()
+
+encoder = OneHotEncoderEstimator(inputCols = ['ratecode_id'], outputCols = ['ratecode_e'])
+encoder_transformer = encoder.fit(df_indexed)
+df_rate_encoded = encoder_transformer.transform(df_indexed)
+df_rate_e = df_rate_encoded.select('RateCodeID', 'ratecode_e')
+df_rate_encoded.show()
+df_rate_e.show()
+
+#encode trip type
+df_trip = spark.read.csv('trip_type.csv', header=True, inferSchema=True)
+df_trip.show()
+
+df_indexed = df_trip
+indexer = StringIndexer(inputCol='trip_type', outputCol='trip_id')
+index_transformer = indexer.fit(df_indexed)
+df_indexed = index_transformer.transform(df_indexed)
+
+df_indexed.show()
+
+encoder = OneHotEncoderEstimator(inputCols = ['trip_id'], outputCols = ['trip_type_e'])
+encoder_transformer = encoder.fit(df_indexed)
+df_trip_encoded = encoder_transformer.transform(df_indexed)
+df_trip_e = df_trip_encoded.select('trip_type', 'trip_type_e')
+df_trip_encoded.show()
+df_trip_e.show()
+
+#encode rush hour
+df_rush = spark.read.csv('rush_hour.csv', header=True, inferSchema=True)
+df_rush.show()
+
+df_indexed = df_rush
+indexer = StringIndexer(inputCol='rush_hour', outputCol='rushid')
+index_transformer = indexer.fit(df_indexed)
+df_indexed = index_transformer.transform(df_indexed)
+df_indexed.show()
+
+encoder = OneHotEncoderEstimator(inputCols = ['rushid'], outputCols = ['rush_e'])
+encoder_transformer = encoder.fit(df_indexed)
+df_rush_encoded = encoder_transformer.transform(df_indexed)
+df_rush_e = df_rush_encoded.select('rush_hour', 'rush_e')
+df_rush_encoded.show()
+df_rush_e.show()
+
+df_full_e = df_full.join(df_date_encoded, on = ['pickup_date']) \
+                   .join(df_rate_e, on = ['RatecodeID']) \
+                   .join(df_trip_e, on = ['trip_type']) \
+                   .join(df_rush_e, on = ['rush_hour'])
+
+df_full_e.show(5)
+
+df_full_e.columns[7:]
+
+from pyspark.ml.feature import VectorAssembler
+assembler = VectorAssembler(inputCols = df_full_e.columns[7:] + ['trip_distance', 'passenger_count'], outputCol = 'features')
+df_vec = assembler.transform(df_full_e)
+df_vec.show(10)
+
+df_train, df_test = df_vec.randomSplit([0.7, 0.3])
+
+from pyspark.ml.regression import LinearRegression
+
+lr = LinearRegression(featuresCol = 'features', labelCol = 'fare_amount')
+
+lr_model = lr.fit(df_train)
+
+print( lr_model.coefficients )  # slope of the linear equation
+print( lr_model.intercept )     # intercept of the line
+
+lr_model.summary.pValues
+
+lr_model.summary.r2adj
+
+
+
+predicted = lr_model.evaluate(df_test)
+
+predicted.rootMeanSquaredError
